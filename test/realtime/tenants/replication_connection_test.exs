@@ -742,6 +742,21 @@ defmodule Realtime.Tenants.ReplicationConnectionTest do
 
       assert Process.alive?(replication_pid)
     end
+
+    test "broadcasts system message to operations topic when streaming starts", %{tenant: tenant} do
+      Phoenix.PubSub.subscribe(Realtime.PubSub, "realtime:operations:" <> tenant.external_id)
+
+      start_link_supervised!(
+        {ReplicationConnection, %ReplicationConnection{tenant_id: tenant.external_id, monitored_pid: self()}},
+        restart: :transient
+      )
+
+      assert_receive %Phoenix.Socket.Broadcast{
+                       event: "system",
+                       payload: %{extension: "broadcast", status: "ok", message: "Replication connection established"}
+                     },
+                     5000
+    end
   end
 
   describe "publication validation steps" do
@@ -860,11 +875,34 @@ defmodule Realtime.Tenants.ReplicationConnectionTest do
     end
 
     test "returns disconnect when results list contains a Postgrex.Error" do
+      tenant_id = random_string()
+      Phoenix.PubSub.subscribe(Realtime.PubSub, "realtime:operations:" <> tenant_id)
+
       error = %Postgrex.Error{message: "something went wrong"}
-      state = %ReplicationConnection{step: :start_replication_slot}
+      state = %ReplicationConnection{step: :start_replication_slot, tenant_id: tenant_id}
 
       assert {:disconnect, "Error starting replication: something went wrong"} =
                ReplicationConnection.handle_result([error], state)
+
+      refute_receive %Phoenix.Socket.Broadcast{event: "system"}
+    end
+
+    test "does not broadcast when replication slot result is successful, deferred to handle_data" do
+      tenant_id = random_string()
+      Phoenix.PubSub.subscribe(Realtime.PubSub, "realtime:operations:" <> tenant_id)
+
+      state = %ReplicationConnection{
+        step: :start_replication_slot,
+        tenant_id: tenant_id,
+        replication_slot_name: "test_slot",
+        publication_name: "test_pub",
+        proto_version: 2
+      }
+
+      assert {:stream, _query, [], %{step: :streaming, replication_started: false}} =
+               ReplicationConnection.handle_result([%Postgrex.Result{num_rows: 1}], state)
+
+      refute_receive %Phoenix.Socket.Broadcast{event: "system"}
     end
   end
 
@@ -887,7 +925,7 @@ defmodule Realtime.Tenants.ReplicationConnectionTest do
       wal_end = 1_000_000
       # KeepAlive binary: ?k + wal_end(64) + clock(64) + reply(8), reply=0 means :later
       keep_alive = <<?k, wal_end::64, 0::64, 0::8>>
-      state = %ReplicationConnection{tenant_id: "test", step: :streaming}
+      state = %ReplicationConnection{tenant_id: "test", step: :streaming, replication_started: true}
 
       assert {:noreply, message, ^state} = ReplicationConnection.handle_data(keep_alive, state)
 
@@ -899,10 +937,37 @@ defmodule Realtime.Tenants.ReplicationConnectionTest do
       assert reply_byte == 0
     end
 
+    test "broadcasts the system message and flips replication_started on the first frame" do
+      tenant_id = random_string()
+      Phoenix.PubSub.subscribe(Realtime.PubSub, "realtime:operations:" <> tenant_id)
+
+      wal_end = 1_000_000
+      keep_alive = <<?k, wal_end::64, 0::64, 0::8>>
+      state = %ReplicationConnection{tenant_id: tenant_id, step: :streaming, replication_started: false}
+
+      assert {:noreply, _message, %{replication_started: true}} =
+               ReplicationConnection.handle_data(keep_alive, state)
+
+      assert_receive %Phoenix.Socket.Broadcast{
+        event: "system",
+        payload: %{extension: "broadcast", status: "ok", message: "Replication connection established"}
+      }
+    end
+
+    test "gracefully disconnects when the replication started broadcast fails" do
+      wal_end = 1_000_000
+      keep_alive = <<?k, wal_end::64, 0::64, 0::8>>
+      # A non-binary tenant_id makes the topic interpolation raise, exercising the rescue path
+      state = %ReplicationConnection{tenant_id: nil, step: :streaming, replication_started: false}
+
+      assert {:disconnect, :unable_to_broadcast_replication_started} =
+               ReplicationConnection.handle_data(keep_alive, state)
+    end
+
     test "sends standby_status when reply is :now" do
       wal_end = 2_000_000
       keep_alive = <<?k, wal_end::64, 0::64, 1::8>>
-      state = %ReplicationConnection{tenant_id: "test", step: :streaming}
+      state = %ReplicationConnection{tenant_id: "test", step: :streaming, replication_started: true}
 
       assert {:noreply, message, ^state} = ReplicationConnection.handle_data(keep_alive, state)
 

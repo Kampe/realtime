@@ -33,6 +33,7 @@ defmodule Realtime.Tenants.ReplicationConnection do
   alias Realtime.Tenants
   alias Realtime.Tenants.Cache
   alias RealtimeWeb.RealtimeChannel
+  alias RealtimeWeb.RealtimeChannel.MessageDispatcher
   alias RealtimeWeb.Socket.UserBroadcast
   alias RealtimeWeb.TenantBroadcaster
 
@@ -58,7 +59,8 @@ defmodule Realtime.Tenants.ReplicationConnection do
           buffer: list(),
           monitored_pid: pid(),
           latency_committed_at: integer(),
-          query_timeout: timeout()
+          query_timeout: timeout(),
+          replication_started: boolean()
         }
   defstruct tenant_id: nil,
             opts: [],
@@ -71,7 +73,8 @@ defmodule Realtime.Tenants.ReplicationConnection do
             buffer: [],
             monitored_pid: nil,
             latency_committed_at: nil,
-            query_timeout: @default_query_timeout
+            query_timeout: @default_query_timeout,
+            replication_started: false
 
   @table "messages"
   @schema "realtime"
@@ -309,17 +312,29 @@ defmodule Realtime.Tenants.ReplicationConnection do
 
   @impl true
   def handle_data(data, state) when is_keep_alive(data) do
-    %KeepAlive{reply: reply, wal_end: wal_end} = parse(data)
-    wal_end = wal_end + 1
+    case maybe_broadcast_replication_started(state) do
+      {:ok, state} ->
+        %KeepAlive{reply: reply, wal_end: wal_end} = parse(data)
+        wal_end = wal_end + 1
 
-    message = standby_status(wal_end, wal_end, wal_end, reply)
+        message = standby_status(wal_end, wal_end, wal_end, reply)
 
-    {:noreply, message, state}
+        {:noreply, message, state}
+
+      {:error, reason} ->
+        {:disconnect, reason}
+    end
   end
 
   def handle_data(data, state) when is_write(data) do
-    %Write{message: message} = parse(data)
-    message |> decode_message(state.relations) |> then(&handle_message(&1, state))
+    case maybe_broadcast_replication_started(state) do
+      {:ok, state} ->
+        %Write{message: message} = parse(data)
+        message |> decode_message(state.relations) |> then(&handle_message(&1, state))
+
+      {:error, reason} ->
+        {:disconnect, reason}
+    end
   end
 
   def handle_data(e, state) do
@@ -433,6 +448,33 @@ defmodule Realtime.Tenants.ReplicationConnection do
   def handle_disconnect(state) do
     Logger.warning("Disconnecting broadcast changes handler in the step : #{inspect(state.step)}")
     {:noreply, %{state | step: :disconnected}}
+  end
+
+  defp maybe_broadcast_replication_started(%{replication_started: false, tenant_id: tenant_id} = state) do
+    case broadcast_replication_started(tenant_id) do
+      :ok -> {:ok, %{state | replication_started: true}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp maybe_broadcast_replication_started(state), do: {:ok, state}
+
+  defp broadcast_replication_started(tenant_id) do
+    msg = %Phoenix.Socket.Broadcast{
+      event: "system",
+      payload: %{extension: "broadcast", status: "ok", message: "Replication connection established"}
+    }
+
+    Phoenix.PubSub.broadcast!(
+      Realtime.PubSub,
+      "realtime:operations:" <> tenant_id,
+      msg,
+      MessageDispatcher
+    )
+  rescue
+    e ->
+      log_error("UnableToBroadcastReplicationStarted", e)
+      {:error, :unable_to_broadcast_replication_started}
   end
 
   defp supervisor_spec(tenant_id) do

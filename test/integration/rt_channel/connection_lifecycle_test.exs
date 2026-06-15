@@ -12,6 +12,7 @@ defmodule Realtime.Integration.RtChannel.ConnectionLifecycleTest do
   alias Phoenix.Socket.Message
   alias Realtime.Integration.WebsocketClient
   alias Realtime.Tenants
+  alias Realtime.Tenants.Connect
   alias RealtimeWeb.UserSocket
 
   @moduletag :capture_log
@@ -50,6 +51,26 @@ defmodule Realtime.Integration.RtChannel.ConnectionLifecycleTest do
         end)
 
       assert log =~ "MissingAPIKey"
+    end
+  end
+
+  describe "replication connection establishment" do
+    test "broadcasts a system message to the operations topic once replication is streaming" do
+      tenant = Containers.checkout_tenant(run_migrations: true)
+
+      Phoenix.PubSub.subscribe(Realtime.PubSub, "realtime:operations:" <> tenant.external_id)
+
+      {:ok, _db_conn} = Connect.lookup_or_start_connection(tenant.external_id)
+
+      assert_receive %Phoenix.Socket.Broadcast{
+                       event: "system",
+                       payload: %{
+                         extension: "broadcast",
+                         status: "ok",
+                         message: "Replication connection established"
+                       }
+                     },
+                     5000
     end
   end
 
